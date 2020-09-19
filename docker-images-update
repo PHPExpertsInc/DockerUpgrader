@@ -1,0 +1,117 @@
+#!/bin/env bash
+
+## Docker Upgrader
+##   Easily upgrade your third-party Docker images!
+##   https://github.com/PHPExpertsInc/DockerUpgrader
+##
+## Copyright © 2020 Theodore R. Smith <theodore@phpexperts.pro>
+##   GPG Fingerprint: 4BF8 2613 1C34 87AC D28F  2AD8 EB24 A91D D612 5690
+##   https://stackoverflow.com/users/story/430062
+##
+## Based off of the work of
+##  * https://jakemccrary.com/blog/2020/04/21/using-bash-preexec-for-monitoring-the-runtime-of-your-last-command/
+##
+## This file is licensed under the Apache v2.0 License.
+
+################## <kids.sh> ####################
+# From https://stackoverflow.com/a/47557466/430062
+# Mostly Copyright (c) 2017 Michael Linhard
+# Copied from ./find-kids.sh
+get_kids() {
+    local parent_id=$1
+    docker inspect --format='ID {{.Id}} PAR {{.Parent}}' $(docker images -a -q) | grep "PAR ${parent_id}" | sed -E "s/ID ([^ ]*) PAR ([^ ]*)/\1/g"
+}
+
+find_actual_kids() {
+    local parent_id=$1
+    # sed with brackets: https://serverfault.com/a/828633/56309
+    if [ -z "$2" ]; then
+        parent_id=$(docker inspect --format '{{.Id}}' $1)
+    else
+        local tags=$(docker inspect --format='{{.RepoTags}}' ${parent_id}  | sed  's/[][]//g')
+        if [ ! -z "$tags" ]; then
+            echo " * ${tags}"
+        fi
+    fi
+
+    local children=`get_kids "${parent_id}"`
+
+    for c in $children;
+    do
+        find_actual_kids "$c" 1
+    done
+}
+################## </kids.sh> ###################
+
+## Set up tput for multi-terminal color support.
+function initColors() {
+    if [ $(builtin type -P "tput" 2>&1)  ]; then
+        # See http://linuxcommand.org/lc3_adv_tput.php
+        #     https://archive.is/S5kFN
+        tput init
+        BOLD=$(tput bold)
+        BG_RED=$(tput setab 1)
+        BG_BLUE=$(tput setab 4)
+        RESET=$(tput sgr0)
+    else
+        # See https://misc.flogisoft.com/bash/tip_colors_and_formatting
+        #     https://archive.is/Z9Q2Q
+        BOLD="\033[1m"
+        BG_RED="\033[41m"
+        BG_RED="\033[44m"
+        RESET="\033[0m"
+    fi
+}
+
+function assertHasProg() {
+    if [ ! $(builtin type -P "$1" 2>&1)  ]; then
+        echo "${BOLD}${BG_RED}  Error: Cannot find \`$1\`.  ${RESET}"
+        exit 2
+    fi
+}
+
+initColors
+
+## 0. Make sure that awk is installed.
+assertHasProg docker
+assertHasProg awk
+assertHasProg sed
+
+## 1. Record the images as they already exist.
+ORIG_LOG=/tmp/docker-upgrader.$(date +"%Y-%m-%d.%H_%M").log
+docker images > "$ORIG_LOG"
+
+## 2. Stop all of the running Docker containers.
+docker stop ($docker ps -aq)
+
+## 3. Update all of the images, most out of date first.
+for repo in $(docker images | awk '{print $1":"$2}' | grep ^m | awk '{ print $1; }' | tac)
+do
+    echo $repo
+    docker pull $repo
+done
+
+## 4. Remove the now-orphaned old images.
+docker rmi --stop $(docker images | grep '<none>' | awk '{print $3}')
+
+## 5. Find the outdated children and report them.
+for image in $(docker images | grep '<none>' | awk '{print $1":"$2";"$3}')
+do
+    repo=$(echo $image | sed 's/;.*//g')
+    imageID=$(echo $image | sed 's/.*;//g')
+
+    echo "${BG_BLUE}  Outdated $repo is needed by image(s): ${RESET}"
+    find_actual_kids "$imageID"
+done
+
+echo ""
+echo "Consider manually updating or removing any out-of-date images."
+
+## 6. Show the upgrade report
+UPDATED_LOG=/tmp/docker-upgrader.$(date +"%Y-%m-%d.%H_%M").log
+docker images > "${UPDATED_LOG}"
+
+diff -y  --suppress-common-lines ${ORIG_LOG} ${UPDATED_LOG}
+
+# 6. Cleanup
+rm /tmp/docker-upgrader*
